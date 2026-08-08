@@ -55,6 +55,8 @@ run_worker_first = ["/api/*", "/identity/*", "/notifications/*"]
 # Base URL for the worker, used for generating up/down URLs for files.
 # If not set, the base URL will be extracted from the incoming request.
 BASE_URL = "https://wardenworker.kylegibson.net"
+# Show Create account in the web vault (registration still gated by ALLOWED_EMAILS).
+DISABLE_USER_REGISTRATION = "false"
 
 # Server-side password hashing PBKDF2 iterations (stored per-user).
 # Defaults to 600000, and will be clamped to a minimum of 600000 even if set lower.
