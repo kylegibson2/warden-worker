@@ -89,18 +89,17 @@ pub async fn handle(req: Request, env: &Env, method: &Method, path: &str, url: &
 }
 
 fn with_security_headers(mut resp: Response) -> Response {
-    if let Ok(headers) = resp.headers_mut() {
-        let _ = headers.set(
-            "Strict-Transport-Security",
-            crate::security_headers::HSTS,
-        );
-        let _ = headers.set(
-            "X-Content-Type-Options",
-            crate::security_headers::X_CONTENT_TYPE_OPTIONS,
-        );
-        let _ = headers.set("X-Frame-Options", crate::security_headers::X_FRAME_OPTIONS);
-        let _ = headers.set("Referrer-Policy", crate::security_headers::REFERRER_POLICY);
-    }
+    let headers = resp.headers_mut();
+    let _ = headers.set(
+        "Strict-Transport-Security",
+        crate::security_headers::HSTS,
+    );
+    let _ = headers.set(
+        "X-Content-Type-Options",
+        crate::security_headers::X_CONTENT_TYPE_OPTIONS,
+    );
+    let _ = headers.set("X-Frame-Options", crate::security_headers::X_FRAME_OPTIONS);
+    let _ = headers.set("Referrer-Policy", crate::security_headers::REFERRER_POLICY);
     resp
 }
 
