@@ -214,7 +214,7 @@ pub fn api_router(env: Env) -> Router {
             "/api/emergency-access/granted",
             get(emergency_access::get_granted_access),
         )
-        // Devices (stub - device tracking not implemented, JWT-based auth)
+        // Devices
         .route("/api/devices", get(devices::get_devices))
         .route("/api/devices/knowndevice", get(devices::get_known_device))
         .route(
@@ -236,6 +236,12 @@ pub fn api_router(env: Env) -> Router {
         .route(
             "/api/devices/identifier/{device_id}/clear-token",
             post(devices::post_clear_device_token),
+        )
+        // Single-device revoke (Bitwarden DELETE /devices/{id}; not in Vaultwarden)
+        .route("/api/devices/{device_id}", delete(devices::delete_device))
+        .route(
+            "/api/devices/{device_id}/deactivate",
+            post(devices::post_deactivate_device),
         )
         // WebAuthn (stub - prevents 404 errors, passkeys not supported)
         .route("/api/webauthn", get(webauth::get_webauthn_credentials))

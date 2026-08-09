@@ -228,3 +228,55 @@ pub async fn post_clear_device_token(
 ) -> Result<Json<Value>, AppError> {
     clear_device_token(env, claims, device_id).await
 }
+
+/// Revoke a single device session for the authenticated user.
+///
+/// Compatible with Bitwarden's `DELETE /devices/{id}` and deprecated
+/// `POST /devices/{id}/deactivate`. Vaultwarden does not implement these routes;
+/// we hard-delete the device row (our auth already treats a missing device as
+/// logged out). Scoped to `claims.sub` so other users' devices can never be
+/// revoked. Self-revoke is allowed (this device's next API call will 401).
+async fn deactivate_device(
+    env: Arc<Env>,
+    claims: Claims,
+    device_id: String,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let device = Device::find_by_identifier_and_user(&db, &device_id, &claims.sub)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Device not found".to_string()))?;
+
+    // Unregister push before deleting the row so we still have push_uuid.
+    if let Some(cfg) = push::push_config(&env)? {
+        if let Err(e) = push::unregister_push_device(&cfg, device.push_uuid.as_deref()).await {
+            log::warn!(
+                "Failed to unregister push for device {} (continuing revoke): {e}",
+                device.identifier
+            );
+        }
+    }
+
+    Device::delete_by_identifier_and_user(&db, &device.identifier, &claims.sub).await?;
+
+    Ok(Json(json!({})))
+}
+
+/// DELETE /devices/{device_id} — Bitwarden DevicesApi.deactivate
+#[worker::send]
+pub async fn delete_device(
+    State(env): State<Arc<Env>>,
+    claims: Claims,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    deactivate_device(env, claims, device_id).await
+}
+
+/// POST /devices/{device_id}/deactivate — deprecated Bitwarden alias (still used by web vault SDK)
+#[worker::send]
+pub async fn post_deactivate_device(
+    State(env): State<Arc<Env>>,
+    claims: Claims,
+    Path(device_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    deactivate_device(env, claims, device_id).await
+}

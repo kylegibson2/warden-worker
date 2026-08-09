@@ -94,9 +94,12 @@ The frontend is bundled with the Worker using [Cloudflare Workers Static Assets]
 - No separate Pages deployment or domain configuration needed.
 
 **UI overrides (optional):**
-- This project ships a small set of "lightweight self-host" UI tweaks in `public/css/`.
-- In CI/CD (and optionally locally), we apply them after extracting `bw_web_builds`:
-  - `mkdir -p public/web-vault/css/ && cp public/css/vaultwarden.css public/web-vault/css/`
+- This project ships a small set of "lightweight self-host" UI tweaks in `public/css/` and `public/js/`.
+- In CI/CD (and optionally locally), we apply them after extracting `bw_web_builds` (see `scripts/cf-build.sh`):
+  - `mkdir -p public/web-vault/css/ public/web-vault/js/`
+  - `cp public/css/vaultwarden.css public/web-vault/css/`
+  - `cp public/js/warden-devices.js public/web-vault/js/` and inject the script into `index.html`
+- `warden-devices.js` adds a **Revoke a device** panel on Settings → Devices (upstream has no per-device remove button).
 
 > [!NOTE]
 > Migrating from separate frontend deployment? If you previously deployed the frontend separately to Cloudflare Pages, you can delete the `warden-frontend` Pages project and re-setup the router for the worker. The frontend is now bundled with the Worker and no longer requires a separate deployment.

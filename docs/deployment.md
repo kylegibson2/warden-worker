@@ -77,10 +77,14 @@ This page covers the available deployment paths. Pick the one that fits your wor
    find public/web-vault -type f -name '*.map' -delete
    ```
 
-   **Optional:** Apply lightweight UI overrides to generate `public/web-vault/css/vaultwarden.css`:
+   **Optional:** Apply lightweight UI overrides (`vaultwarden.css` + Devices revoke script):
 
    ```bash
-   mkdir -p public/web-vault/css/ && cp public/css/vaultwarden.css public/web-vault/css/
+   mkdir -p public/web-vault/css/ public/web-vault/js/
+   cp public/css/vaultwarden.css public/web-vault/css/
+   cp public/js/warden-devices.js public/web-vault/js/
+   # Inject <script defer src="js/warden-devices.js"></script> before </body> in index.html
+   # (scripts/cf-build.sh does this automatically).
    ```
 
 6. **Set up database and deploy the worker:**

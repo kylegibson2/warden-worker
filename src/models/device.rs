@@ -275,6 +275,30 @@ impl Device {
             .map_err(|_| AppError::Database)?;
         Ok(())
     }
+
+    /// Delete a single device for a user (scoped by both identifier and user_id).
+    ///
+    /// Removes the refresh token / 2FA-remember token for that session. Access tokens
+    /// for that device fail on the next authenticated request because auth requires
+    /// the device row to still exist. Does not rotate the account security stamp.
+    /// Callers should look the device up first (for NotFound / push cleanup).
+    pub async fn delete_by_identifier_and_user(
+        db: &crate::db::Db,
+        identifier: &str,
+        user_id: &str,
+    ) -> Result<(), AppError> {
+        d1_query!(
+            db,
+            "DELETE FROM devices WHERE identifier = ?1 AND user_id = ?2",
+            identifier,
+            user_id
+        )
+        .map_err(|_| AppError::Database)?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+        Ok(())
+    }
 }
 
 fn generate_refresh_token() -> Result<String, AppError> {

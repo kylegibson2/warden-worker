@@ -85,9 +85,24 @@ if [ ! -d public/web-vault ]; then
 fi
 # Drop source maps to satisfy Cloudflare's per-file static asset size limit.
 find public/web-vault -type f -name '*.map' -delete
-# Apply the lightweight UI override and security headers for static assets.
-mkdir -p public/web-vault/css/
+# Apply the lightweight UI overrides and security headers for static assets.
+mkdir -p public/web-vault/css/ public/web-vault/js/
 cp public/css/vaultwarden.css public/web-vault/css/
+cp public/js/warden-devices.js public/web-vault/js/
+# bw_web_builds already links css/vaultwarden.css; inject our Devices revoke script
+# before the deferred app bundles so window.fetch is patched before API traffic.
+if [ -f public/web-vault/index.html ]; then
+  if ! grep -q 'js/warden-devices.js' public/web-vault/index.html; then
+    awk '{
+      if (!done && $0 ~ /<script defer="defer" src="app\/polyfills/) {
+        print "<script defer=\"defer\" src=\"js/warden-devices.js\"></script>"
+        done=1
+      }
+      print
+    }' public/web-vault/index.html > public/web-vault/index.html.tmp
+    mv public/web-vault/index.html.tmp public/web-vault/index.html
+  fi
+fi
 cp public/_headers public/web-vault/_headers
 echo "Frontend ready in public/web-vault"
 

@@ -7,7 +7,8 @@
 
   Usage:
   - After CI/CD or local download of bw_web_builds and extraction, keep `public/web-vault/` as the static resource root directory.
-  - Run: `mkdir -p public/web-vault/css/ && cp public/css/vaultwarden.css public/web-vault/css/`
+  - Prefer `scripts/cf-build.sh` (copies CSS + Devices JS and injects the script tag).
+  - Manual: `mkdir -p public/web-vault/css/ && cp public/css/vaultwarden.css public/web-vault/css/`
 */
 
 /* Hide unsupported UI elements */
@@ -71,4 +72,97 @@ bit-nav-logo bit-nav-item a:before {
 
 bit-nav-logo bit-nav-item .bwi-shield {
   display: none !important;
+}
+
+/* Per-device revoke panel (public/js/warden-devices.js) */
+.warden-device-revoke {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--color-border-secondary, #d2d6dc);
+  max-width: 40rem;
+}
+
+.warden-device-revoke__title {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.warden-device-revoke__help,
+.warden-device-revoke__empty {
+  margin: 0 0 0.85rem;
+  font-size: 0.875rem;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.4;
+}
+
+.warden-device-revoke__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.warden-device-revoke__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--color-border-secondary, #d2d6dc);
+  border-radius: 4px;
+}
+
+.warden-device-revoke__meta {
+  min-width: 0;
+}
+
+.warden-device-revoke__name {
+  font-weight: 500;
+  font-size: 0.95rem;
+}
+
+.warden-device-revoke__badge {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  vertical-align: middle;
+  border-radius: 3px;
+  background: var(--color-primary-100, #dbeafe);
+  color: var(--color-primary-700, #1d4ed8);
+}
+
+.warden-device-revoke__sub {
+  margin-top: 0.15rem;
+  font-size: 0.75rem;
+  color: var(--color-text-muted, #6b7280);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.warden-device-revoke__btn {
+  flex-shrink: 0;
+  cursor: pointer;
+  border: 1px solid var(--color-danger-600, #dc2626);
+  background: transparent;
+  color: var(--color-danger-600, #dc2626);
+  border-radius: 4px;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.warden-device-revoke__btn:hover:not(:disabled) {
+  background: var(--color-danger-600, #dc2626);
+  color: #fff;
+}
+
+.warden-device-revoke__btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
