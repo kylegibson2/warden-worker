@@ -2,6 +2,8 @@
 //!
 //! Secrets:
 //! - `RESEND_API_KEY` — Resend API key
+//!
+//! Config (secret preferred, plaintext variable also accepted):
 //! - `RESEND_EMAIL_SEND` — verified From address (e.g. `noreply@example.com`)
 
 use serde_json::json;
@@ -21,10 +23,22 @@ fn secret_string(env: &Env, name: &str) -> Result<String, AppError> {
     Ok(value.to_string())
 }
 
+fn resend_from_address(env: &Env) -> Result<String, AppError> {
+    if let Ok(value) = env.secret("RESEND_EMAIL_SEND") {
+        return Ok(value.to_string());
+    }
+    if let Ok(value) = env.var("RESEND_EMAIL_SEND") {
+        return Ok(value.to_string());
+    }
+    Err(AppError::BadRequest(
+        "Missing `RESEND_EMAIL_SEND`. Set it as a Worker secret or variable.".to_string(),
+    ))
+}
+
 /// Send a plain-text (and simple HTML) email through Resend.
 pub async fn send_email(env: &Env, to: &str, subject: &str, text: &str) -> Result<(), AppError> {
     let api_key = secret_string(env, "RESEND_API_KEY")?;
-    let from = secret_string(env, "RESEND_EMAIL_SEND")?;
+    let from = resend_from_address(env)?;
 
     let html = format!("<p>{}</p>", html_escape(text));
     let body = serde_json::to_string(&json!({
