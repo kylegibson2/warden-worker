@@ -266,5 +266,12 @@ pub fn api_router(env: Env) -> Router {
             put(twofactor::disable_twofactor_put),
         )
         .route("/api/two-factor/get-recover", post(twofactor::get_recover))
+        .route("/api/two-factor/get-email", post(twofactor::get_email))
+        .route("/api/two-factor/send-email", post(twofactor::send_email))
+        .route("/api/two-factor/email", put(twofactor::activate_email))
+        .route(
+            "/api/two-factor/send-email-login",
+            post(twofactor::send_email_login),
+        )
         .with_state(app_state)
 }

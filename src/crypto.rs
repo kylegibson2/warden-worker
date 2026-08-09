@@ -174,6 +174,22 @@ pub fn base32_encode(data: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648 { padding: true }, data)
 }
 
+/// Generates a numeric email 2FA token (`digits` long, default 6).
+pub fn generate_email_token(digits: usize) -> Result<String, AppError> {
+    let digits = digits.clamp(4, 12);
+    let crypto = get_crypto()?;
+    let bytes = Uint8Array::new_with_length(digits as u32);
+    crypto
+        .get_random_values_with_array_buffer_view(&bytes)
+        .map_err(|e| AppError::Crypto(format!("Failed to generate email token: {:?}", e)))?;
+    let mut out = String::with_capacity(digits);
+    for i in 0..digits {
+        let n = bytes.get_index(i as u32) % 10;
+        out.push(char::from(b'0' + n));
+    }
+    Ok(out)
+}
+
 /// Generates a random TOTP secret (20 bytes = 160 bits).
 /// Returns the Base32 encoded secret.
 pub fn generate_totp_secret() -> Result<String, AppError> {

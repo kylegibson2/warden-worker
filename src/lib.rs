@@ -13,6 +13,7 @@ mod db;
 mod durable;
 mod error;
 mod handlers;
+mod mail;
 mod models;
 mod notifications;
 mod push;

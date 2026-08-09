@@ -26,13 +26,16 @@ use crate::{
     error::AppError,
     handlers::{
         allow_totp_drift, server_password_iterations,
-        twofactor::{is_twofactor_enabled, list_user_twofactors},
+        twofactor::{
+            enabled_twofactor_provider_ids, is_twofactor_enabled, list_user_twofactors, obscure_email,
+            validate_email_login_code,
+        },
     },
     models::{
         auth_request::AuthRequest,
         device::{Device, DeviceType},
         send::{SendAccessTokenResponse, SendDB},
-        twofactor::{TwoFactor, TwoFactorType},
+        twofactor::{EmailTokenData, TwoFactor, TwoFactorType},
         user::User,
     },
     push,
@@ -402,42 +405,38 @@ fn validate_remember_token(
     raw_token: &str,
     twofactor_ids: &[i32],
 ) -> Result<(), AppError> {
+    let required = || AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids, None));
     let secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
     let key = Hs256Key::new(secret.as_bytes());
-    let token = UntrustedToken::new(raw_token)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+    let token = UntrustedToken::new(raw_token).map_err(|_| required())?;
     let token = jwt_compact::alg::Hs256
         .validator::<RememberJwtClaims>(&key)
         .validate(&token)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+        .map_err(|_| required())?;
     let time_options = jwt_time_options();
     token
         .claims()
         .validate_expiration(&time_options)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+        .map_err(|_| required())?;
     token
         .claims()
         .validate_maturity(&time_options)
-        .map_err(|_| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+        .map_err(|_| required())?;
 
     let remember_claims = token.into_parts().1.custom;
     if remember_claims.iss != REMEMBER_TOKEN_ISSUER
         || remember_claims.sub.as_str() != device.identifier.as_str()
         || remember_claims.user_uuid.as_str() != user.id.as_str()
     {
-        return Err(AppError::TwoFactorRequired(json_err_twofactor(
-            twofactor_ids,
-        )));
+        return Err(required());
     }
 
     let stored_token = device
         .twofactor_remember
         .as_deref()
-        .ok_or_else(|| AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids)))?;
+        .ok_or_else(required)?;
     if !constant_time_eq(stored_token.as_bytes(), raw_token.as_bytes()) {
-        return Err(AppError::TwoFactorRequired(json_err_twofactor(
-            twofactor_ids,
-        )));
+        return Err(required());
     }
 
     Ok(())
@@ -585,13 +584,23 @@ pub async fn token(
             .await?;
 
             let twofactors: Vec<TwoFactor> = list_user_twofactors(&db, &user.id).await?;
-            let twofactor_ids = vec![TwoFactorType::Authenticator as i32];
+            let twofactor_ids = enabled_twofactor_provider_ids(&twofactors);
+            let email_2fa_address = twofactors
+                .iter()
+                .find(|tf| tf.enabled && tf.atype == TwoFactorType::Email as i32)
+                .and_then(|tf| EmailTokenData::from_json(&tf.data).ok())
+                .map(|d| d.email);
             let mut should_issue_remember = false;
 
             if is_twofactor_enabled(&twofactors) {
-                let selected_id = payload.two_factor_provider.unwrap_or(twofactor_ids[0]);
+                let selected_id = payload
+                    .two_factor_provider
+                    .unwrap_or_else(|| twofactor_ids[0]);
                 let twofactor_code = payload.two_factor_token.as_deref().ok_or_else(|| {
-                    AppError::TwoFactorRequired(json_err_twofactor(&twofactor_ids))
+                    AppError::TwoFactorRequired(json_err_twofactor(
+                        &twofactor_ids,
+                        email_2fa_address.as_deref(),
+                    ))
                 })?;
 
                 match TwoFactorType::from_i32(selected_id) {
@@ -621,6 +630,16 @@ pub async fn token(
                         .await
                         .map_err(|_| AppError::Database)?;
 
+                        should_issue_remember = payload.two_factor_remember == Some(1);
+                    }
+                    Some(TwoFactorType::Email) => {
+                        let tf = twofactors
+                            .iter()
+                            .find(|tf| tf.enabled && tf.atype == TwoFactorType::Email as i32)
+                            .ok_or_else(|| {
+                                AppError::BadRequest("Email 2FA not configured".to_string())
+                            })?;
+                        validate_email_login_code(&db, &user.id, twofactor_code, &tf.data).await?;
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
                     Some(TwoFactorType::Remember) => {
@@ -783,7 +802,7 @@ pub async fn token(
 }
 
 /// Generates the JSON error response for 2FA required
-fn json_err_twofactor(providers: &[i32]) -> Value {
+fn json_err_twofactor(providers: &[i32], email_2fa: Option<&str>) -> Value {
     let mut result = serde_json::json!({
         "error": "invalid_grant",
         "error_description": "Two factor required.",
@@ -795,6 +814,14 @@ fn json_err_twofactor(providers: &[i32]) -> Value {
     });
 
     for provider in providers {
+        if *provider == TwoFactorType::Email as i32 {
+            if let Some(email) = email_2fa {
+                result["TwoFactorProviders2"][provider.to_string()] = serde_json::json!({
+                    "Email": obscure_email(email),
+                });
+                continue;
+            }
+        }
         result["TwoFactorProviders2"][provider.to_string()] = Value::Null;
     }
 

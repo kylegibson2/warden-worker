@@ -1,4 +1,4 @@
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde_json::Value;
 use std::sync::Arc;
 use worker::Env;
@@ -6,13 +6,17 @@ use worker::Env;
 use crate::d1_query;
 use crate::{
     auth::AuthUser,
-    crypto::{base32_decode, ct_eq, generate_recovery_code, generate_totp_secret, validate_totp},
+    crypto::{
+        base32_decode, ct_eq, generate_email_token, generate_recovery_code, generate_totp_secret,
+        validate_totp,
+    },
     db,
     error::AppError,
     handlers::allow_totp_drift,
+    mail,
     models::twofactor::{
-        DisableAuthenticatorData, DisableTwoFactorData, EnableAuthenticatorData, TwoFactor,
-        TwoFactorType,
+        ActivateEmailData, DisableAuthenticatorData, DisableTwoFactorData, EmailTokenData,
+        EnableAuthenticatorData, SendEmailData, SendEmailLoginData, TwoFactor, TwoFactorType,
     },
     models::user::{PasswordOrOtpData, User},
 };
@@ -33,12 +37,45 @@ pub(crate) async fn list_user_twofactors(
 
 /// Whether the user has 2FA enabled.
 ///
-/// For now, we intentionally only treat Authenticator (TOTP) as a real 2FA provider.
-/// Remember-device tokens are never considered a 2FA method by themselves.
+/// Authenticator (TOTP) and Email count. Remember-device tokens do not.
 pub(crate) fn is_twofactor_enabled(twofactors: &[TwoFactor]) -> bool {
-    twofactors
+    twofactors.iter().any(|tf| {
+        tf.enabled
+            && (tf.atype == TwoFactorType::Authenticator as i32
+                || tf.atype == TwoFactorType::Email as i32)
+    })
+}
+
+/// Enabled login providers for the Bitwarden two-factor challenge response.
+pub(crate) fn enabled_twofactor_provider_ids(twofactors: &[TwoFactor]) -> Vec<i32> {
+    let mut ids: Vec<i32> = twofactors
         .iter()
-        .any(|tf| tf.enabled && tf.atype == TwoFactorType::Authenticator as i32)
+        .filter(|tf| {
+            tf.enabled
+                && (tf.atype == TwoFactorType::Authenticator as i32
+                    || tf.atype == TwoFactorType::Email as i32)
+        })
+        .map(|tf| tf.atype)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Obscure an email for client UI (Vaultwarden-compatible).
+pub(crate) fn obscure_email(email: &str) -> String {
+    let Some((name, domain)) = email.rsplit_once('@') else {
+        return "***".to_string();
+    };
+    let name_size = name.chars().count();
+    let new_name = if (1..=3).contains(&name_size) {
+        "*".repeat(name_size)
+    } else {
+        let stars = "*".repeat(name_size.saturating_sub(2));
+        let prefix: String = name.chars().take(2).collect();
+        format!("{prefix}{stars}")
+    };
+    format!("{new_name}@{domain}")
 }
 
 /// GET /api/two-factor - Get all enabled 2FA providers for current user
@@ -427,6 +464,313 @@ async fn generate_recovery_code_for_user(
     }
 
     Ok(())
+}
+
+/// POST /api/two-factor/get-email
+#[worker::send]
+pub async fn get_email(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(&user, &data).await?;
+
+    let existing = find_twofactor(&db, &user_id, TwoFactorType::Email).await?;
+    let (enabled, email) = match existing {
+        Some(tf) => {
+            let data = EmailTokenData::from_json(&tf.data)?;
+            (true, Value::String(data.email))
+        }
+        None => (false, Value::Null),
+    };
+
+    Ok(Json(serde_json::json!({
+        "email": email,
+        "enabled": enabled,
+        "object": "twoFactorEmail"
+    })))
+}
+
+/// POST /api/two-factor/send-email — send ownership verification code while enabling Email 2FA.
+#[worker::send]
+pub async fn send_email(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<SendEmailData>,
+) -> Result<StatusCode, AppError> {
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(
+        &user,
+        &PasswordOrOtpData {
+            master_password_hash: data.master_password_hash,
+            otp: data.otp,
+        },
+    )
+    .await?;
+
+    let email = data.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(AppError::BadRequest("Invalid email".to_string()));
+    }
+
+    // Remove any prior email 2FA / pending challenge for a clean enable flow.
+    d1_query!(
+        &db,
+        "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype IN (?2, ?3)",
+        &user_id,
+        TwoFactorType::Email as i32,
+        TwoFactorType::EmailVerificationChallenge as i32
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    let token = generate_email_token(EmailTokenData::TOKEN_DIGITS)?;
+    let token_data = EmailTokenData::new(email.clone(), token.clone());
+    let twofactor = TwoFactor::new(
+        user_id,
+        TwoFactorType::EmailVerificationChallenge,
+        token_data.to_json()?,
+    );
+
+    d1_query!(
+        &db,
+        "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &twofactor.uuid,
+        &twofactor.user_uuid,
+        twofactor.atype,
+        twofactor.enabled as i32,
+        &twofactor.data,
+        twofactor.last_used
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    mail::send_two_factor_token(&env, &email, &token).await?;
+    Ok(StatusCode::OK)
+}
+
+/// PUT /api/two-factor/email — confirm verification code and enable Email 2FA.
+#[worker::send]
+pub async fn activate_email(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<ActivateEmailData>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(
+        &user,
+        &PasswordOrOtpData {
+            master_password_hash: data.master_password_hash,
+            otp: data.otp,
+        },
+    )
+    .await?;
+
+    let mut twofactor = find_twofactor(&db, &user_id, TwoFactorType::EmailVerificationChallenge)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Email verification challenge not found".to_string()))?;
+
+    let mut email_data = EmailTokenData::from_json(&twofactor.data)?;
+    let Some(issued) = email_data.last_token.clone() else {
+        return Err(AppError::BadRequest("No token available".to_string()));
+    };
+    if !ct_eq(&issued, data.token.trim()) {
+        return Err(AppError::BadRequest("Token is invalid".to_string()));
+    }
+    if email_data.email.trim().to_lowercase() != data.email.trim().to_lowercase() {
+        return Err(AppError::BadRequest("Email does not match challenge".to_string()));
+    }
+
+    email_data.reset_token();
+    twofactor.atype = TwoFactorType::Email as i32;
+    twofactor.data = email_data.to_json()?;
+
+    d1_query!(
+        &db,
+        "UPDATE twofactor SET atype = ?1, data = ?2, last_used = 0 WHERE uuid = ?3",
+        twofactor.atype,
+        &twofactor.data,
+        &twofactor.uuid
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    generate_recovery_code_for_user(&db, &user_id).await?;
+
+    Ok(Json(serde_json::json!({
+        "email": email_data.email,
+        "enabled": true,
+        "object": "twoFactorEmail"
+    })))
+}
+
+/// POST /api/two-factor/send-email-login — unauthenticated; send login code after password check.
+#[worker::send]
+pub async fn send_email_login(
+    State(env): State<Arc<Env>>,
+    Json(data): Json<SendEmailLoginData>,
+) -> Result<StatusCode, AppError> {
+    let db = db::get_db(&env)?;
+
+    let email = data
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+
+    let user = User::find_by_email(&db, &email)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+
+    let password_hash = data
+        .master_password_hash
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+
+    let verification = user.verify_master_password(password_hash).await?;
+    if !verification.is_valid() {
+        return Err(AppError::Unauthorized(
+            "Username or password is incorrect. Try again.".to_string(),
+        ));
+    }
+
+    send_login_email_token(&env, &db, &user.id).await?;
+    Ok(StatusCode::OK)
+}
+
+/// Issue (or re-issue) a login email token for an already-enabled Email 2FA user.
+pub(crate) async fn send_login_email_token(
+    env: &Env,
+    db: &crate::db::Db,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let mut twofactor = find_twofactor(db, user_id, TwoFactorType::Email)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Email 2FA is not enabled".to_string()))?;
+
+    let mut email_data = EmailTokenData::from_json(&twofactor.data)?;
+    let token = generate_email_token(EmailTokenData::TOKEN_DIGITS)?;
+    email_data.set_token(token.clone());
+    twofactor.data = email_data.to_json()?;
+
+    d1_query!(
+        db,
+        "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+        &twofactor.data,
+        &twofactor.uuid
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    mail::send_two_factor_token(env, &email_data.email, &token).await
+}
+
+/// Validate an Email 2FA code during `/identity/connect/token`.
+pub(crate) async fn validate_email_login_code(
+    db: &crate::db::Db,
+    user_id: &str,
+    token: &str,
+    data: &str,
+) -> Result<(), AppError> {
+    let mut email_data = EmailTokenData::from_json(data)?;
+    let mut twofactor = find_twofactor(db, user_id, TwoFactorType::Email)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Email 2FA is not enabled".to_string()))?;
+
+    let Some(issued) = email_data.last_token.clone() else {
+        return Err(AppError::BadRequest("No token available".to_string()));
+    };
+
+    if !ct_eq(&issued, token.trim()) {
+        email_data.add_attempt();
+        if email_data.attempts >= EmailTokenData::ATTEMPTS_LIMIT {
+            email_data.reset_token();
+        }
+        twofactor.data = email_data.to_json()?;
+        d1_query!(
+            db,
+            "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+            &twofactor.data,
+            &twofactor.uuid
+        )
+        .map_err(|_| AppError::Database)?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+        return Err(AppError::BadRequest("Token is invalid".to_string()));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    if email_data.token_sent + EmailTokenData::EXPIRATION_SECS < now {
+        email_data.reset_token();
+        twofactor.data = email_data.to_json()?;
+        d1_query!(
+            db,
+            "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+            &twofactor.data,
+            &twofactor.uuid
+        )
+        .map_err(|_| AppError::Database)?
+        .run()
+        .await
+        .map_err(|_| AppError::Database)?;
+        return Err(AppError::BadRequest("Token has expired".to_string()));
+    }
+
+    email_data.reset_token();
+    twofactor.data = email_data.to_json()?;
+    d1_query!(
+        db,
+        "UPDATE twofactor SET data = ?1 WHERE uuid = ?2",
+        &twofactor.data,
+        &twofactor.uuid
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    Ok(())
+}
+
+async fn load_user(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
+    let user_value: Value = db
+        .prepare("SELECT * FROM users WHERE id = ?1")
+        .bind(&[user_id.to_string().into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?
+        .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
+    serde_json::from_value(user_value).map_err(|_| AppError::Internal)
+}
+
+async fn find_twofactor(
+    db: &crate::db::Db,
+    user_id: &str,
+    atype: TwoFactorType,
+) -> Result<Option<TwoFactor>, AppError> {
+    db.prepare("SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype = ?2")
+        .bind(&[user_id.to_string().into(), (atype as i32).into()])?
+        .first(None)
+        .await
+        .map_err(|_| AppError::Database)?
+        .map(|value| serde_json::from_value(value).map_err(|_| AppError::Internal))
+        .transpose()
 }
 
 /// Clear recovery code when no real 2FA providers remain.

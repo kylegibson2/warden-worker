@@ -13,6 +13,8 @@ pub enum TwoFactorType {
     OrganizationDuo = 6,
     Webauthn = 7,
     RecoveryCode = 8,
+    /// Pending email ownership proof before Email 2FA is enabled (excluded from lists).
+    EmailVerificationChallenge = 1000,
 }
 
 impl TwoFactorType {
@@ -27,9 +29,88 @@ impl TwoFactorType {
             6 => Some(TwoFactorType::OrganizationDuo),
             7 => Some(TwoFactorType::Webauthn),
             8 => Some(TwoFactorType::RecoveryCode),
+            1000 => Some(TwoFactorType::EmailVerificationChallenge),
             _ => None,
         }
     }
+}
+
+/// JSON blob stored in `twofactor.data` for Email / EmailVerificationChallenge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailTokenData {
+    pub email: String,
+    pub last_token: Option<String>,
+    pub token_sent: i64,
+    pub attempts: u64,
+}
+
+impl EmailTokenData {
+    pub const TOKEN_DIGITS: usize = 6;
+    pub const EXPIRATION_SECS: i64 = 600;
+    pub const ATTEMPTS_LIMIT: u64 = 3;
+
+    pub fn new(email: String, token: String) -> Self {
+        Self {
+            email,
+            last_token: Some(token),
+            token_sent: chrono::Utc::now().timestamp(),
+            attempts: 0,
+        }
+    }
+
+    pub fn set_token(&mut self, token: String) {
+        self.last_token = Some(token);
+        self.token_sent = chrono::Utc::now().timestamp();
+        self.attempts = 0;
+    }
+
+    pub fn reset_token(&mut self) {
+        self.last_token = None;
+        self.attempts = 0;
+    }
+
+    pub fn add_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    pub fn to_json(&self) -> Result<String, crate::error::AppError> {
+        serde_json::to_string(self).map_err(|_| crate::error::AppError::Internal)
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, crate::error::AppError> {
+        serde_json::from_str(s).map_err(|_| {
+            crate::error::AppError::BadRequest("Could not decode email 2FA data".to_string())
+        })
+    }
+}
+
+/// POST /api/two-factor/send-email
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendEmailData {
+    pub email: String,
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
+}
+
+/// PUT /api/two-factor/email
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateEmailData {
+    pub email: String,
+    pub token: String,
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
+}
+
+/// POST /api/two-factor/send-email-login (unauthenticated)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendEmailLoginData {
+    pub email: Option<String>,
+    pub master_password_hash: Option<String>,
+    pub device_identifier: Option<String>,
 }
 
 /// TwoFactor database model
