@@ -83,9 +83,25 @@ pub async fn handle(req: Request, env: &Env, method: &Method, path: &str, url: &
     };
 
     match result {
-        Ok(resp) => resp,
-        Err(e) => app_error_to_response(&e),
+        Ok(resp) => with_security_headers(resp),
+        Err(e) => with_security_headers(app_error_to_response(&e)),
     }
+}
+
+fn with_security_headers(mut resp: Response) -> Response {
+    if let Ok(headers) = resp.headers_mut() {
+        let _ = headers.set(
+            "Strict-Transport-Security",
+            crate::security_headers::HSTS,
+        );
+        let _ = headers.set(
+            "X-Content-Type-Options",
+            crate::security_headers::X_CONTENT_TYPE_OPTIONS,
+        );
+        let _ = headers.set("X-Frame-Options", crate::security_headers::X_FRAME_OPTIONS);
+        let _ = headers.set("Referrer-Policy", crate::security_headers::REFERRER_POLICY);
+    }
+    resp
 }
 
 fn query_param(url: &Url, key: &str) -> Option<String> {

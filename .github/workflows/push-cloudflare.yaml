@@ -97,9 +97,10 @@ jobs:
           echo "✅ Frontend files extracted to ./public/web-vault"
           ls -la public/web-vault/ | head -20
 
-      - name: Apply web vault overrides (vaultwarden.css)
+      - name: Apply web vault overrides (vaultwarden.css + security headers)
         run: |
           mkdir -p public/web-vault/css/ && cp public/css/vaultwarden.css public/web-vault/css/
+          cp public/_headers public/web-vault/_headers
 
       - name: Replace D1_DATABASE_ID in wrangler.toml
         run: sed -i "s/\${D1_DATABASE_ID}/${{ secrets.D1_DATABASE_ID }}/g" wrangler.toml

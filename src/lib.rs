@@ -17,6 +17,7 @@ mod models;
 mod notifications;
 mod push;
 mod router;
+mod security_headers;
 
 /// Base URL extracted from the incoming request, used for config endpoint.
 #[derive(Clone)]
@@ -60,10 +61,15 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<web_sys::Resp
         .allow_origin(Any);
 
     const BODY_LIMIT: usize = 5 * 1024 * 1024;
+    let (hsts, nosniff, frame, referrer) = security_headers::layers();
 
     let mut app = router::api_router((*env).clone())
         .layer(Extension(BaseUrl(base_url)))
         .layer(cors)
+        .layer(hsts)
+        .layer(nosniff)
+        .layer(frame)
+        .layer(referrer)
         .layer(DefaultBodyLimit::max(BODY_LIMIT));
 
     let resp = app.call(http_req).await?;

@@ -3,7 +3,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_service::Service;
 use worker::{durable_object, DurableObject, Env, HttpRequest, Request, Response, Result, State};
 
-use crate::{router, BaseUrl};
+use crate::{router, security_headers, BaseUrl};
 
 /// Durable Object used to run CPU-heavy API flows with a higher CPU budget.
 ///
@@ -47,11 +47,16 @@ impl DurableObject for HeavyDo {
 
         // Match the main worker's default body limit (5MB) for regular API requests.
         const BODY_LIMIT: usize = 5 * 1024 * 1024;
+        let (hsts, nosniff, frame, referrer) = security_headers::layers();
 
         // Reuse the existing router stack.
         let mut app = router::api_router(self.env.clone())
             .layer(Extension(BaseUrl(base_url)))
             .layer(cors)
+            .layer(hsts)
+            .layer(nosniff)
+            .layer(frame)
+            .layer(referrer)
             .layer(DefaultBodyLimit::max(BODY_LIMIT));
 
         let http_resp = app.call(http_req).await?;
