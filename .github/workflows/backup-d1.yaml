@@ -2,10 +2,9 @@ name: Backup D1 Database (S3/WebDAV)
 permissions:
     contents: read
 
+# Scheduled GitHub Actions backups disabled — project uses Workers Builds, not GHA.
+# Re-enable the schedule if you want Actions-based D1 backups again.
 on:
-    schedule:
-        # Run daily at UTC 04:00 (1 hour after the auto cleanup task)
-        - cron: "0 4 * * *"
     workflow_dispatch:
         inputs:
             environment:

@@ -2,9 +2,9 @@ name: Build
 permissions:
     contents: read
 
+# Deploy is handled by Cloudflare Workers Builds (scripts/cf-build.sh + cf-deploy.sh).
+# Keep this workflow disabled / manual-only to avoid double deploys.
 on:
-  push:
-    branches: [main, uat, release*]
   workflow_dispatch:
 
 jobs:

@@ -2,9 +2,8 @@ name: Deploy Dev
 permissions:
     contents: read
 
+# Deploy is handled by Cloudflare Workers Builds. Manual-only to avoid double deploys.
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 jobs:
