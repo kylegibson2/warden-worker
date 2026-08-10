@@ -42,12 +42,10 @@ app-user-layout app-danger-zone button:nth-child(1),
 
 /* Two-factor providers (hide unsupported ones) */
 /* Email (type 1) is supported — do not hide .providers-2fa-1 */
+/* YubiKey (type 3) is supported — do not hide .providers-2fa-3 */
 
 /* Duo */
 .providers-2fa-2,
-
-/* YubiKey */
-.providers-2fa-3,
 
 /* WebAuthn */
 .providers-2fa-7,
