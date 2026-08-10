@@ -262,11 +262,17 @@
               return d.id !== device.id;
             });
             if (isSelf) {
+              // Self-revoke: session is gone; send user to login.
               location.href = "/#/login";
               location.reload();
               return;
             }
-            location.reload();
+            // Do NOT location.reload() — the web vault keeps crypto keys in
+            // memory only, so a full reload forces master-password unlock.
+            // Re-render this panel in place; the Angular devices table above
+            // refreshes on the next natural navigation/sync.
+            PANEL_VERSION = "";
+            scheduleRender();
           })
           .catch(function (err) {
             btn.disabled = false;
