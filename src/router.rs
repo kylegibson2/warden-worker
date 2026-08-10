@@ -243,7 +243,7 @@ pub fn api_router(env: Env) -> Router {
             "/api/devices/{device_id}/deactivate",
             post(devices::post_deactivate_device),
         )
-        // WebAuthn (stub - prevents 404 errors, passkeys not supported)
+        // WebAuthn passwordless credential list (stub — not account passkey login)
         .route("/api/webauthn", get(webauth::get_webauthn_credentials))
         // Two-factor authentication
         .route("/api/two-factor", get(twofactor::get_twofactor))
@@ -281,6 +281,29 @@ pub fn api_router(env: Env) -> Router {
         )
         .route("/api/two-factor/get-yubikey", post(twofactor::get_yubikey))
         .route("/api/two-factor/yubikey", post(twofactor::activate_yubikey))
-        .route("/api/two-factor/yubikey", put(twofactor::activate_yubikey_put))
+        .route(
+            "/api/two-factor/yubikey",
+            put(twofactor::activate_yubikey_put),
+        )
+        .route(
+            "/api/two-factor/get-webauthn",
+            post(twofactor::get_webauthn),
+        )
+        .route(
+            "/api/two-factor/get-webauthn-challenge",
+            post(twofactor::get_webauthn_challenge),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            post(twofactor::activate_webauthn),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            put(twofactor::activate_webauthn_put),
+        )
+        .route(
+            "/api/two-factor/webauthn",
+            delete(twofactor::delete_webauthn),
+        )
         .with_state(app_state)
 }

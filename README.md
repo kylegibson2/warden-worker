@@ -20,6 +20,7 @@ Warden aims to solve this problem by leveraging the Cloudflare Workers ecosystem
 * **Device Management:** View and revoke active sessions.
 * **Live Sync & Push Notifications:** Real-time vault updates via WebSocket and mobile push.
 * **TOTP Support:** Store and generate Time-based One-Time Passwords.
+* **Two-step Login:** Authenticator (TOTP), Email, YubiKey OTP, and WebAuthn/FIDO2 (passkey as second factor).
 * **Bitwarden Compatible:** Works with official Bitwarden clients.
 * **Free to Host:** Runs on Cloudflare's free tier.
 * **Low Maintenance:** Deploy it once and forget about it.
@@ -51,10 +52,10 @@ See the [deployment guide](docs/deployment.md) for setup details. R2 may incur a
 
 ## Current Status
 
-**This project is not yet feature-complete**, ~~and it may never be~~. It currently supports the core functionality of a personal vault, including TOTP. However, it does **not** support the following features:
+**This project is not yet feature-complete**, ~~and it may never be~~. It currently supports the core functionality of a personal vault, including TOTP, Email 2FA, YubiKey OTP, and WebAuthn/FIDO2 as a **second factor**. However, it does **not** support the following features:
 
 * Sharing
-* 2FA login (except TOTP)
+* Passwordless “Log in with Passkeys” (account passkeys / PRF unlock)
 * Emergency access
 * Admin operations
 * Organizations
@@ -220,6 +221,7 @@ Configure environment variables in `wrangler.toml` under `[vars]`, or set them v
   - Format: Include HTTPS protocol, domain, and port (if using non-443 reverse proxy). Do not include any trailing path.
   - Example: `https://vault.example.com` or `https://vault.example.com:8443`
   - If not set, falls back to extracting from the incoming request.
+  - **Required for WebAuthn/FIDO2 2FA:** the host must be a DNS domain (not a raw IP). The WebAuthn relying party ID is taken from this URL’s domain, and the browser origin must match.
 * **`PASSWORD_ITERATIONS`** (Optional, Default: `600000`):
   - PBKDF2 iterations for server-side password hashing.
   - Minimum is 600000.

@@ -1,4 +1,8 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Extension, State},
+    http::StatusCode,
+    Json,
+};
 use serde_json::Value;
 use std::sync::Arc;
 use worker::Env;
@@ -15,12 +19,13 @@ use crate::{
     handlers::allow_totp_drift,
     mail,
     models::twofactor::{
-        ActivateEmailData, DisableAuthenticatorData, DisableTwoFactorData, EmailTokenData,
-        EnableAuthenticatorData, EnableYubikeyData, SendEmailData, SendEmailLoginData, TwoFactor,
-        TwoFactorType, YubikeyMetadata,
+        ActivateEmailData, DeleteWebauthnData, DisableAuthenticatorData, DisableTwoFactorData,
+        EmailTokenData, EnableAuthenticatorData, EnableWebauthnData, EnableYubikeyData,
+        SendEmailData, SendEmailLoginData, TwoFactor, TwoFactorType, YubikeyMetadata,
     },
     models::user::{PasswordOrOtpData, User},
-    yubico,
+    webauthn::{self, LoginChallengeState, RegisterChallengeState, WebauthnRegistration},
+    yubico, BaseUrl,
 };
 
 /// List all 2FA records for a user (excludes atype >= 1000).
@@ -39,13 +44,17 @@ pub(crate) async fn list_user_twofactors(
 
 /// Whether the user has 2FA enabled.
 ///
-/// Authenticator (TOTP), Email, and YubiKey count. Remember-device tokens do not.
+/// Authenticator (TOTP), Email, YubiKey, and WebAuthn count. Remember-device tokens do not.
 pub(crate) fn is_twofactor_enabled(twofactors: &[TwoFactor]) -> bool {
     twofactors.iter().any(|tf| {
         tf.enabled
             && (tf.atype == TwoFactorType::Authenticator as i32
                 || tf.atype == TwoFactorType::Email as i32
-                || tf.atype == TwoFactorType::YubiKey as i32)
+                || tf.atype == TwoFactorType::YubiKey as i32
+                || (tf.atype == TwoFactorType::Webauthn as i32
+                    && webauthn_registrations_from_data(&tf.data)
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false)))
     })
 }
 
@@ -57,13 +66,24 @@ pub(crate) fn enabled_twofactor_provider_ids(twofactors: &[TwoFactor]) -> Vec<i3
             tf.enabled
                 && (tf.atype == TwoFactorType::Authenticator as i32
                     || tf.atype == TwoFactorType::Email as i32
-                    || tf.atype == TwoFactorType::YubiKey as i32)
+                    || tf.atype == TwoFactorType::YubiKey as i32
+                    || (tf.atype == TwoFactorType::Webauthn as i32
+                        && webauthn_registrations_from_data(&tf.data)
+                            .map(|r| !r.is_empty())
+                            .unwrap_or(false)))
         })
         .map(|tf| tf.atype)
         .collect();
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+fn webauthn_registrations_from_data(
+    data: &str,
+) -> Result<Vec<crate::webauthn::WebauthnRegistration>, AppError> {
+    serde_json::from_str(data)
+        .map_err(|_| AppError::BadRequest("Could not decode WebAuthn 2FA data".to_string()))
 }
 
 /// Obscure an email for client UI (Vaultwarden-compatible).
@@ -580,7 +600,9 @@ pub async fn activate_email(
 
     let mut twofactor = find_twofactor(&db, &user_id, TwoFactorType::EmailVerificationChallenge)
         .await?
-        .ok_or_else(|| AppError::BadRequest("Email verification challenge not found".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("Email verification challenge not found".to_string())
+        })?;
 
     let mut email_data = EmailTokenData::from_json(&twofactor.data)?;
     let Some(issued) = email_data.last_token.clone() else {
@@ -590,7 +612,9 @@ pub async fn activate_email(
         return Err(AppError::BadRequest("Token is invalid".to_string()));
     }
     if email_data.email.trim().to_lowercase() != data.email.trim().to_lowercase() {
-        return Err(AppError::BadRequest("Email does not match challenge".to_string()));
+        return Err(AppError::BadRequest(
+            "Email does not match challenge".to_string(),
+        ));
     }
 
     email_data.reset_token();
@@ -632,17 +656,21 @@ pub async fn send_email_login(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_lowercase())
-        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+        .ok_or_else(|| {
+            AppError::Unauthorized("Username or password is incorrect. Try again.".to_string())
+        })?;
 
-    let user = User::find_by_email(&db, &email)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+    let user = User::find_by_email(&db, &email).await?.ok_or_else(|| {
+        AppError::Unauthorized("Username or password is incorrect. Try again.".to_string())
+    })?;
 
     let password_hash = data
         .master_password_hash
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect. Try again.".to_string()))?;
+        .ok_or_else(|| {
+            AppError::Unauthorized("Username or password is incorrect. Try again.".to_string())
+        })?;
 
     let verification = user.verify_master_password(password_hash).await?;
     if !verification.is_valid() {
@@ -937,4 +965,320 @@ pub async fn activate_yubikey_put(
     data: Json<EnableYubikeyData>,
 ) -> Result<Json<Value>, AppError> {
     activate_yubikey(env, auth_user, data).await
+}
+
+fn jsonify_webauthn(enabled: bool, registrations: &[WebauthnRegistration]) -> Value {
+    let keys: Vec<Value> = registrations
+        .iter()
+        .map(WebauthnRegistration::to_client_json)
+        .collect();
+    serde_json::json!({
+        "enabled": enabled,
+        "keys": keys,
+        "object": "twoFactorWebAuthn",
+    })
+}
+
+fn jsonify_webauthn_u2f(enabled: bool, registrations: &[WebauthnRegistration]) -> Value {
+    // Activate/delete responses historically use twoFactorU2f (Vaultwarden-compatible).
+    let keys: Vec<Value> = registrations
+        .iter()
+        .map(WebauthnRegistration::to_client_json)
+        .collect();
+    serde_json::json!({
+        "enabled": enabled,
+        "keys": keys,
+        "object": "twoFactorU2f",
+    })
+}
+
+fn relying_party_from_base(base_url: &str) -> Result<webauthn::RelyingParty, AppError> {
+    webauthn::RelyingParty::from_base_url(base_url)
+}
+
+async fn upsert_twofactor_row(db: &crate::db::Db, twofactor: &TwoFactor) -> Result<(), AppError> {
+    d1_query!(
+        db,
+        "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype = ?2",
+        &twofactor.user_uuid,
+        twofactor.atype
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    d1_query!(
+        db,
+        "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &twofactor.uuid,
+        &twofactor.user_uuid,
+        twofactor.atype,
+        twofactor.enabled as i32,
+        &twofactor.data,
+        twofactor.last_used
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+async fn delete_twofactor_type(
+    db: &crate::db::Db,
+    user_id: &str,
+    atype: TwoFactorType,
+) -> Result<(), AppError> {
+    d1_query!(
+        db,
+        "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype = ?2",
+        user_id,
+        atype as i32
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+    Ok(())
+}
+
+pub(crate) async fn load_webauthn_registrations(
+    db: &crate::db::Db,
+    user_id: &str,
+) -> Result<(bool, Vec<WebauthnRegistration>), AppError> {
+    match find_twofactor(db, user_id, TwoFactorType::Webauthn).await? {
+        Some(tf) => Ok((tf.enabled, webauthn_registrations_from_data(&tf.data)?)),
+        None => Ok((false, Vec::new())),
+    }
+}
+
+/// Create a login challenge and persist state (atype 1004). Returns PublicKeyCredentialRequestOptions.
+pub(crate) async fn generate_webauthn_login_options(
+    db: &crate::db::Db,
+    base_url: &str,
+    user_id: &str,
+) -> Result<Value, AppError> {
+    let rp = relying_party_from_base(base_url)?;
+    let (_enabled, registrations) = load_webauthn_registrations(db, user_id).await?;
+    let (options, state) = webauthn::start_authentication(&rp, &registrations)?;
+    let tf = TwoFactor::new(
+        user_id.to_string(),
+        TwoFactorType::WebauthnLoginChallenge,
+        serde_json::to_string(&state).map_err(|_| AppError::Internal)?,
+    );
+    upsert_twofactor_row(db, &tf).await?;
+    Ok(options)
+}
+
+/// Validate a WebAuthn assertion for login (`twoFactorToken` JSON).
+pub(crate) async fn validate_webauthn_login(
+    db: &crate::db::Db,
+    base_url: &str,
+    user_id: &str,
+    assertion_json: &str,
+) -> Result<(), AppError> {
+    let rp = relying_party_from_base(base_url)?;
+    let state_tf = find_twofactor(db, user_id, TwoFactorType::WebauthnLoginChallenge)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Can't recover login challenge".to_string()))?;
+    let state: LoginChallengeState = serde_json::from_str(&state_tf.data)
+        .map_err(|_| AppError::BadRequest("Can't recover login challenge".to_string()))?;
+    delete_twofactor_type(db, user_id, TwoFactorType::WebauthnLoginChallenge).await?;
+
+    let (enabled, mut registrations) = load_webauthn_registrations(db, user_id).await?;
+    if !enabled || registrations.is_empty() {
+        return Err(AppError::BadRequest(
+            "WebAuthn 2FA not configured".to_string(),
+        ));
+    }
+
+    webauthn::finish_authentication(&rp, &state, &mut registrations, assertion_json).await?;
+
+    let data = serde_json::to_string(&registrations).map_err(|_| AppError::Internal)?;
+    let tf = TwoFactor::new(user_id.to_string(), TwoFactorType::Webauthn, data);
+    upsert_twofactor_row(db, &tf).await?;
+    Ok(())
+}
+
+/// POST /api/two-factor/get-webauthn
+#[worker::send]
+pub async fn get_webauthn(
+    State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    let _rp = relying_party_from_base(&base_url)?;
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(&user, &data).await?;
+
+    let (enabled, registrations) = load_webauthn_registrations(&db, &user_id).await?;
+    Ok(Json(jsonify_webauthn(enabled, &registrations)))
+}
+
+/// POST /api/two-factor/get-webauthn-challenge
+#[worker::send]
+pub async fn get_webauthn_challenge(
+    State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    let rp = relying_party_from_base(&base_url)?;
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(&user, &data).await?;
+
+    let (_enabled, registrations) = load_webauthn_registrations(&db, &user_id).await?;
+    let exclude: Vec<String> = registrations
+        .iter()
+        .map(|r| r.credential.cred_id.clone())
+        .collect();
+
+    let display_name = user
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| user.email.clone());
+
+    let (options, state) =
+        webauthn::start_registration(&rp, &user.id, &user.email, &display_name, &exclude)?;
+    let tf = TwoFactor::new(
+        user_id.clone(),
+        TwoFactorType::WebauthnRegisterChallenge,
+        serde_json::to_string(&state).map_err(|_| AppError::Internal)?,
+    );
+    upsert_twofactor_row(&db, &tf).await?;
+    Ok(Json(options))
+}
+
+/// POST /api/two-factor/webauthn
+#[worker::send]
+pub async fn activate_webauthn(
+    State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<EnableWebauthnData>,
+) -> Result<Json<Value>, AppError> {
+    let rp = relying_party_from_base(&base_url)?;
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(
+        &user,
+        &PasswordOrOtpData {
+            master_password_hash: data.master_password_hash.clone(),
+            otp: data.otp.clone(),
+        },
+    )
+    .await?;
+
+    let slot_id = data.id.into_i32()?;
+    if !(1..=5).contains(&slot_id) {
+        return Err(AppError::BadRequest(
+            "WebAuthn key id must be between 1 and 5".to_string(),
+        ));
+    }
+    if data.name.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "WebAuthn key name is required".to_string(),
+        ));
+    }
+
+    let challenge_tf = find_twofactor(&db, &user_id, TwoFactorType::WebauthnRegisterChallenge)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Can't recover challenge".to_string()))?;
+    let state: RegisterChallengeState = serde_json::from_str(&challenge_tf.data)
+        .map_err(|_| AppError::BadRequest("Can't recover challenge".to_string()))?;
+    delete_twofactor_type(&db, &user_id, TwoFactorType::WebauthnRegisterChallenge).await?;
+
+    let credential = webauthn::finish_registration(&rp, &state, &data.device_response)?;
+
+    let (_enabled, mut registrations) = load_webauthn_registrations(&db, &user_id).await?;
+    if registrations
+        .iter()
+        .any(|r| r.credential.cred_id == credential.cred_id)
+    {
+        return Err(AppError::BadRequest(
+            "WebAuthn credential already registered".to_string(),
+        ));
+    }
+    // Replace same slot id if re-registering.
+    registrations.retain(|r| r.id != slot_id);
+    if registrations.len() >= 5 {
+        return Err(AppError::BadRequest(
+            "Maximum of 5 WebAuthn keys allowed".to_string(),
+        ));
+    }
+    registrations.push(WebauthnRegistration {
+        id: slot_id,
+        name: data.name,
+        migrated: false,
+        credential,
+    });
+    registrations.sort_by_key(|r| r.id);
+
+    let tf = TwoFactor::new(
+        user_id.clone(),
+        TwoFactorType::Webauthn,
+        serde_json::to_string(&registrations).map_err(|_| AppError::Internal)?,
+    );
+    upsert_twofactor_row(&db, &tf).await?;
+    generate_recovery_code_for_user(&db, &user_id).await?;
+
+    Ok(Json(jsonify_webauthn_u2f(true, &registrations)))
+}
+
+/// PUT /api/two-factor/webauthn
+#[worker::send]
+pub async fn activate_webauthn_put(
+    env: State<Arc<Env>>,
+    base_url: Extension<BaseUrl>,
+    auth_user: AuthUser,
+    data: Json<EnableWebauthnData>,
+) -> Result<Json<Value>, AppError> {
+    activate_webauthn(env, base_url, auth_user, data).await
+}
+
+/// DELETE /api/two-factor/webauthn
+#[worker::send]
+pub async fn delete_webauthn(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<DeleteWebauthnData>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    if !user
+        .verify_master_password(&data.master_password_hash)
+        .await?
+        .is_valid()
+    {
+        return Err(AppError::Unauthorized("Invalid password".to_string()));
+    }
+
+    let slot_id = data.id.into_i32()?;
+    let Some(tf) = find_twofactor(&db, &user_id, TwoFactorType::Webauthn).await? else {
+        return Err(AppError::BadRequest("Webauthn data not found!".to_string()));
+    };
+    let mut registrations = webauthn_registrations_from_data(&tf.data)?;
+    let Some(pos) = registrations.iter().position(|r| r.id == slot_id) else {
+        return Err(AppError::BadRequest("Webauthn entry not found".to_string()));
+    };
+    registrations.remove(pos);
+
+    if registrations.is_empty() {
+        delete_twofactor_type(&db, &user_id, TwoFactorType::Webauthn).await?;
+        clear_recovery_if_no_twofactor(&db, &user_id).await?;
+        return Ok(Json(jsonify_webauthn_u2f(false, &[])));
+    }
+
+    let updated = TwoFactor::new(
+        user_id.clone(),
+        TwoFactorType::Webauthn,
+        serde_json::to_string(&registrations).map_err(|_| AppError::Internal)?,
+    );
+    upsert_twofactor_row(&db, &updated).await?;
+    Ok(Json(jsonify_webauthn_u2f(true, &registrations)))
 }

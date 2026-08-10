@@ -47,6 +47,9 @@ sha2 = "0.11"
 hex = "0.4"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 constant_time_eq = "0.4"
+# WebAuthn attestation object (CBOR) + BASE_URL parsing for RP ID / origin
+ciborium = "0.2"
+url = "2"
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }

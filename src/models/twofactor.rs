@@ -15,6 +15,10 @@ pub enum TwoFactorType {
     RecoveryCode = 8,
     /// Pending email ownership proof before Email 2FA is enabled (excluded from lists).
     EmailVerificationChallenge = 1000,
+    /// Pending WebAuthn registration ceremony state (excluded from lists).
+    WebauthnRegisterChallenge = 1003,
+    /// Pending WebAuthn login ceremony state (excluded from lists).
+    WebauthnLoginChallenge = 1004,
 }
 
 impl TwoFactorType {
@@ -30,9 +34,51 @@ impl TwoFactorType {
             7 => Some(TwoFactorType::Webauthn),
             8 => Some(TwoFactorType::RecoveryCode),
             1000 => Some(TwoFactorType::EmailVerificationChallenge),
+            1003 => Some(TwoFactorType::WebauthnRegisterChallenge),
+            1004 => Some(TwoFactorType::WebauthnLoginChallenge),
             _ => None,
         }
     }
+}
+
+/// Slot id that may arrive as JSON number or string (Bitwarden clients vary).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+
+impl NumberOrString {
+    pub fn into_i32(self) -> Result<i32, crate::error::AppError> {
+        match self {
+            NumberOrString::Number(n) => i32::try_from(n).map_err(|_| {
+                crate::error::AppError::BadRequest("Invalid WebAuthn key id".to_string())
+            }),
+            NumberOrString::String(s) => s.parse().map_err(|_| {
+                crate::error::AppError::BadRequest("Invalid WebAuthn key id".to_string())
+            }),
+        }
+    }
+}
+
+/// POST/PUT /api/two-factor/webauthn
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnableWebauthnData {
+    pub id: NumberOrString,
+    pub name: String,
+    pub device_response: crate::webauthn::RegisterPublicKeyCredential,
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
+}
+
+/// DELETE /api/two-factor/webauthn
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteWebauthnData {
+    pub id: NumberOrString,
+    pub master_password_hash: String,
 }
 
 /// JSON blob stored in `twofactor.data` for Email / EmailVerificationChallenge.

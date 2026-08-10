@@ -47,13 +47,12 @@ app-user-layout app-danger-zone button:nth-child(1),
 /* Duo */
 .providers-2fa-2,
 
-/* WebAuthn */
-.providers-2fa-7,
+/* WebAuthn 2FA (type 7) is supported — do not hide .providers-2fa-7 */
 
 /* Emergency access (not supported) */
 bit-nav-item[route="settings/emergency-access"],
 
-/* Passkey settings (not supported) */
+/* Passwordless passkey login settings (not supported; distinct from WebAuthn 2FA) */
 app-user-layout app-password-settings app-webauthn-login-settings {
   display: none !important;
 }

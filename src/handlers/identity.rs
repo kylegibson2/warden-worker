@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
     Form, Json,
@@ -27,8 +27,9 @@ use crate::{
     handlers::{
         allow_totp_drift, server_password_iterations,
         twofactor::{
-            enabled_twofactor_provider_ids, is_twofactor_enabled, list_user_twofactors, obscure_email,
-            validate_email_login_code,
+            enabled_twofactor_provider_ids, generate_webauthn_login_options, is_twofactor_enabled,
+            list_user_twofactors, obscure_email, validate_email_login_code,
+            validate_webauthn_login,
         },
     },
     models::{
@@ -38,7 +39,7 @@ use crate::{
         twofactor::{EmailTokenData, TwoFactor, TwoFactorType, YubikeyMetadata},
         user::User,
     },
-    push, yubico,
+    push, yubico, BaseUrl,
 };
 
 const PASSWORD_SCOPE: &str = "api offline_access";
@@ -403,40 +404,36 @@ fn validate_remember_token(
     user: &User,
     device: &Device,
     raw_token: &str,
-    twofactor_ids: &[i32],
 ) -> Result<(), AppError> {
-    let required = || AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids, None, None));
+    let invalid = || AppError::Unauthorized("Invalid remember token".to_string());
     let secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
     let key = Hs256Key::new(secret.as_bytes());
-    let token = UntrustedToken::new(raw_token).map_err(|_| required())?;
+    let token = UntrustedToken::new(raw_token).map_err(|_| invalid())?;
     let token = jwt_compact::alg::Hs256
         .validator::<RememberJwtClaims>(&key)
         .validate(&token)
-        .map_err(|_| required())?;
+        .map_err(|_| invalid())?;
     let time_options = jwt_time_options();
     token
         .claims()
         .validate_expiration(&time_options)
-        .map_err(|_| required())?;
+        .map_err(|_| invalid())?;
     token
         .claims()
         .validate_maturity(&time_options)
-        .map_err(|_| required())?;
+        .map_err(|_| invalid())?;
 
     let remember_claims = token.into_parts().1.custom;
     if remember_claims.iss != REMEMBER_TOKEN_ISSUER
         || remember_claims.sub.as_str() != device.identifier.as_str()
         || remember_claims.user_uuid.as_str() != user.id.as_str()
     {
-        return Err(required());
+        return Err(invalid());
     }
 
-    let stored_token = device
-        .twofactor_remember
-        .as_deref()
-        .ok_or_else(required)?;
+    let stored_token = device.twofactor_remember.as_deref().ok_or_else(invalid)?;
     if !constant_time_eq(stored_token.as_bytes(), raw_token.as_bytes()) {
-        return Err(required());
+        return Err(invalid());
     }
 
     Ok(())
@@ -546,6 +543,7 @@ fn generate_tokens_and_response(
 #[worker::send]
 pub async fn token(
     State(env): State<Arc<Env>>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     headers: HeaderMap,
     Form(payload): Form<TokenRequest>,
 ) -> Result<Response, AppError> {
@@ -601,13 +599,20 @@ pub async fn token(
                 let selected_id = payload
                     .two_factor_provider
                     .unwrap_or_else(|| twofactor_ids[0]);
-                let twofactor_code = payload.two_factor_token.as_deref().ok_or_else(|| {
-                    AppError::TwoFactorRequired(json_err_twofactor(
-                        &twofactor_ids,
-                        email_2fa_address.as_deref(),
-                        yubikey_nfc,
-                    ))
-                })?;
+                let twofactor_code = match payload.two_factor_token.as_deref() {
+                    Some(code) => code,
+                    None => {
+                        return Err(twofactor_required_error(
+                            &db,
+                            &base_url,
+                            &user.id,
+                            &twofactor_ids,
+                            email_2fa_address.as_deref(),
+                            yubikey_nfc,
+                        )
+                        .await?);
+                    }
+                };
 
                 match TwoFactorType::from_i32(selected_id) {
                     Some(TwoFactorType::Authenticator) => {
@@ -661,11 +666,7 @@ pub async fn token(
                         }
                         let meta = YubikeyMetadata::from_json(&tf.data)?;
                         let public_id = &otp[..12];
-                        if !meta
-                            .keys
-                            .iter()
-                            .any(|k| k.eq_ignore_ascii_case(public_id))
-                        {
+                        if !meta.keys.iter().any(|k| k.eq_ignore_ascii_case(public_id)) {
                             return Err(AppError::BadRequest(
                                 "Given YubiKey is not registered".to_string(),
                             ));
@@ -673,14 +674,24 @@ pub async fn token(
                         yubico::verify_otp(env.as_ref(), otp).await?;
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
+                    Some(TwoFactorType::Webauthn) => {
+                        validate_webauthn_login(&db, &base_url, &user.id, twofactor_code).await?;
+                        should_issue_remember = payload.two_factor_remember == Some(1);
+                    }
                     Some(TwoFactorType::Remember) => {
-                        validate_remember_token(
-                            env.as_ref(),
-                            &user,
-                            &device,
-                            twofactor_code,
-                            &twofactor_ids,
-                        )?;
+                        if validate_remember_token(env.as_ref(), &user, &device, twofactor_code)
+                            .is_err()
+                        {
+                            return Err(twofactor_required_error(
+                                &db,
+                                &base_url,
+                                &user.id,
+                                &twofactor_ids,
+                                email_2fa_address.as_deref(),
+                                yubikey_nfc,
+                            )
+                            .await?);
+                        }
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
                     Some(TwoFactorType::RecoveryCode) => {
@@ -832,11 +843,33 @@ pub async fn token(
     }
 }
 
+async fn twofactor_required_error(
+    db: &crate::db::Db,
+    base_url: &str,
+    user_id: &str,
+    twofactor_ids: &[i32],
+    email_2fa: Option<&str>,
+    yubikey_nfc: Option<bool>,
+) -> Result<AppError, AppError> {
+    let webauthn = if twofactor_ids.contains(&(TwoFactorType::Webauthn as i32)) {
+        Some(generate_webauthn_login_options(db, base_url, user_id).await?)
+    } else {
+        None
+    };
+    Ok(AppError::TwoFactorRequired(json_err_twofactor(
+        twofactor_ids,
+        email_2fa,
+        yubikey_nfc,
+        webauthn,
+    )))
+}
+
 /// Generates the JSON error response for 2FA required
 fn json_err_twofactor(
     providers: &[i32],
     email_2fa: Option<&str>,
     yubikey_nfc: Option<bool>,
+    webauthn_options: Option<Value>,
 ) -> Value {
     let mut result = serde_json::json!({
         "error": "invalid_grant",
@@ -862,6 +895,12 @@ fn json_err_twofactor(
                 result["TwoFactorProviders2"][provider.to_string()] = serde_json::json!({
                     "Nfc": nfc,
                 });
+                continue;
+            }
+        }
+        if *provider == TwoFactorType::Webauthn as i32 {
+            if let Some(ref options) = webauthn_options {
+                result["TwoFactorProviders2"][provider.to_string()] = options.clone();
                 continue;
             }
         }

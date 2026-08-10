@@ -246,6 +246,177 @@ pub async fn hmac_sha1(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
     Ok(Uint8Array::new(&signature).to_vec())
 }
 
+/// Convert a DER-encoded ECDSA signature to IEEE P1363 (r||s) for Web Crypto.
+fn ecdsa_der_to_p1363(der: &[u8]) -> Result<Vec<u8>, AppError> {
+    // Minimal SEQUENCE { INTEGER r, INTEGER s } parser for P-256 (32-byte components).
+    if der.len() < 8 || der[0] != 0x30 {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let mut idx = 1;
+    let seq_len = read_der_len(der, &mut idx)?;
+    if idx + seq_len != der.len() {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let r = read_der_integer(der, &mut idx)?;
+    let s = read_der_integer(der, &mut idx)?;
+    if idx != der.len() {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&pad_left_32(&r)?);
+    out.extend_from_slice(&pad_left_32(&s)?);
+    Ok(out)
+}
+
+fn read_der_len(data: &[u8], idx: &mut usize) -> Result<usize, AppError> {
+    if *idx >= data.len() {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let b = data[*idx];
+    *idx += 1;
+    if b & 0x80 == 0 {
+        return Ok(b as usize);
+    }
+    let n = (b & 0x7f) as usize;
+    if n == 0 || n > 2 || *idx + n > data.len() {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let mut len = 0usize;
+    for _ in 0..n {
+        len = (len << 8) | data[*idx] as usize;
+        *idx += 1;
+    }
+    Ok(len)
+}
+
+fn read_der_integer(data: &[u8], idx: &mut usize) -> Result<Vec<u8>, AppError> {
+    if *idx >= data.len() || data[*idx] != 0x02 {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    *idx += 1;
+    let len = read_der_len(data, idx)?;
+    if *idx + len > data.len() || len == 0 {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let bytes = data[*idx..*idx + len].to_vec();
+    *idx += len;
+    Ok(bytes)
+}
+
+fn pad_left_32(int_bytes: &[u8]) -> Result<[u8; 32], AppError> {
+    // Strip leading zero padding from DER INTEGER, then left-pad to 32 bytes.
+    let mut v = int_bytes;
+    while v.len() > 1 && v[0] == 0 {
+        v = &v[1..];
+    }
+    if v.len() > 32 {
+        return Err(AppError::BadRequest(
+            "Invalid assertion signature encoding".to_string(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    out[32 - v.len()..].copy_from_slice(v);
+    Ok(out)
+}
+
+/// Verify an ES256 (P-256 + SHA-256) WebAuthn assertion signature via SubtleCrypto.
+///
+/// `public_key` must be an uncompressed SEC1 point (`0x04 || X || Y`, 65 bytes).
+/// `signature` may be DER or raw P1363 (`r||s`).
+pub async fn verify_es256_signature(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), AppError> {
+    if public_key.len() != 65 || public_key[0] != 0x04 {
+        return Err(AppError::BadRequest(
+            "Invalid P-256 public key encoding".to_string(),
+        ));
+    }
+
+    let sig_p1363 = if signature.len() == 64 {
+        signature.to_vec()
+    } else {
+        ecdsa_der_to_p1363(signature)?
+    };
+
+    let subtle = subtle_crypto()?;
+
+    let key_alg = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &key_alg,
+        &JsValue::from_str("name"),
+        &JsValue::from_str("ECDSA"),
+    )
+    .map_err(|e| AppError::Crypto(format!("Failed to set ECDSA name: {e:?}")))?;
+    js_sys::Reflect::set(
+        &key_alg,
+        &JsValue::from_str("namedCurve"),
+        &JsValue::from_str("P-256"),
+    )
+    .map_err(|e| AppError::Crypto(format!("Failed to set namedCurve: {e:?}")))?;
+
+    let key_usages = js_sys::Array::of1(&JsValue::from_str("verify"));
+    let key_array = Uint8Array::new_from_slice(public_key);
+    let crypto_key = JsFuture::from(
+        subtle
+            .import_key_with_object("raw", &key_array, &key_alg, false, &key_usages)
+            .map_err(|e| AppError::Crypto(format!("ECDSA import_key failed: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AppError::Crypto(format!("ECDSA import_key await failed: {e:?}")))?;
+
+    let verify_alg = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &verify_alg,
+        &JsValue::from_str("name"),
+        &JsValue::from_str("ECDSA"),
+    )
+    .map_err(|e| AppError::Crypto(format!("Failed to set verify alg name: {e:?}")))?;
+    js_sys::Reflect::set(
+        &verify_alg,
+        &JsValue::from_str("hash"),
+        &JsValue::from_str("SHA-256"),
+    )
+    .map_err(|e| AppError::Crypto(format!("Failed to set verify hash: {e:?}")))?;
+
+    let sig_array = Uint8Array::new_from_slice(&sig_p1363);
+    let msg_array = Uint8Array::new_from_slice(message);
+    let ok = JsFuture::from(
+        subtle
+            .verify_with_object_and_buffer_source_and_buffer_source(
+                &verify_alg,
+                &CryptoKey::from(crypto_key),
+                &sig_array,
+                &msg_array,
+            )
+            .map_err(|e| AppError::Crypto(format!("ECDSA verify failed: {e:?}")))?,
+    )
+    .await
+    .map_err(|e| AppError::Crypto(format!("ECDSA verify await failed: {e:?}")))?;
+
+    if ok.as_bool() != Some(true) {
+        return Err(AppError::BadRequest(
+            "WebAuthn signature verification failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generates a TOTP code for the given secret and time.
 ///
 /// # Arguments
