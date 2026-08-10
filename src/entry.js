@@ -105,11 +105,16 @@ const HEAVY_DO_ROUTE_METHODS = new Map([
   // Key rotation needs verify master password and update entire vault
   ["/api/accounts/key-management/rotate-user-account-keys", new Set(["POST"])],
 
-  // Two-factor
+  // Two-factor (password verification is CPU-heavy; offload like authenticator)
   ["/api/two-factor/get-authenticator", new Set(["POST"])],
   ["/api/two-factor/authenticator", new Set(["POST", "PUT", "DELETE"])],
   ["/api/two-factor/disable", new Set(["POST", "PUT"])],
   ["/api/two-factor/get-recover", new Set(["POST"])],
+  ["/api/two-factor/get-email", new Set(["POST"])],
+  ["/api/two-factor/send-email", new Set(["POST"])],
+  ["/api/two-factor/email", new Set(["PUT"])],
+  ["/api/two-factor/get-yubikey", new Set(["POST"])],
+  ["/api/two-factor/yubikey", new Set(["POST", "PUT"])],
 ]);
 
 function shouldOffloadToHeavyDo(request, url) {

@@ -229,14 +229,21 @@ impl YubikeyMetadata {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnableYubikeyData {
+    #[serde(alias = "Key1")]
     pub key1: Option<String>,
+    #[serde(alias = "Key2")]
     pub key2: Option<String>,
+    #[serde(alias = "Key3")]
     pub key3: Option<String>,
+    #[serde(alias = "Key4")]
     pub key4: Option<String>,
+    #[serde(alias = "Key5")]
     pub key5: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "Nfc")]
     pub nfc: bool,
+    #[serde(alias = "MasterPasswordHash")]
     pub master_password_hash: Option<String>,
+    #[serde(alias = "Otp")]
     pub otp: Option<String>,
 }
 

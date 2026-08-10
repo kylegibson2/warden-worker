@@ -107,7 +107,15 @@ impl IntoResponse for AppError {
                     AppError::TwoFactorRequired(_) | AppError::ApiJson { .. } => unreachable!(),
                 };
 
-                let body = Json(json!({ "error": error_message }));
+                // Bitwarden clients parse ErrorResponse via `Message` / `message`.
+                // Returning only `{ "error": ... }` makes the UI show a generic toast.
+                let body = Json(json!({
+                    "message": error_message,
+                    "validationErrors": null,
+                    "exceptionMessage": null,
+                    "exceptionStackTrace": null,
+                    "object": "error",
+                }));
                 (status, body).into_response()
             }
         }
