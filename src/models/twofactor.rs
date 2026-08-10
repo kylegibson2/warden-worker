@@ -203,3 +203,50 @@ pub struct DisableAuthenticatorData {
     #[serde(rename = "type")]
     pub r#type: i32,
 }
+
+/// Stored YubiKey public ids (first 12 chars of OTPs) for login checks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YubikeyMetadata {
+    #[serde(rename = "keys", alias = "Keys")]
+    pub keys: Vec<String>,
+    #[serde(rename = "nfc", alias = "Nfc")]
+    pub nfc: bool,
+}
+
+impl YubikeyMetadata {
+    pub fn to_json(&self) -> Result<String, crate::error::AppError> {
+        serde_json::to_string(self).map_err(|_| crate::error::AppError::Internal)
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, crate::error::AppError> {
+        serde_json::from_str(s).map_err(|_| {
+            crate::error::AppError::BadRequest("Could not decode Yubikey data".to_string())
+        })
+    }
+}
+
+/// POST/PUT /api/two-factor/yubikey
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnableYubikeyData {
+    pub key1: Option<String>,
+    pub key2: Option<String>,
+    pub key3: Option<String>,
+    pub key4: Option<String>,
+    pub key5: Option<String>,
+    #[serde(default)]
+    pub nfc: bool,
+    pub master_password_hash: Option<String>,
+    pub otp: Option<String>,
+}
+
+impl EnableYubikeyData {
+    pub fn otps(&self) -> Vec<String> {
+        [&self.key1, &self.key2, &self.key3, &self.key4, &self.key5]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect()
+    }
+}

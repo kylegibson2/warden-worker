@@ -279,5 +279,8 @@ pub fn api_router(env: Env) -> Router {
             "/api/two-factor/send-email-login",
             post(twofactor::send_email_login),
         )
+        .route("/api/two-factor/get-yubikey", post(twofactor::get_yubikey))
+        .route("/api/two-factor/yubikey", post(twofactor::activate_yubikey))
+        .route("/api/two-factor/yubikey", put(twofactor::activate_yubikey_put))
         .with_state(app_state)
 }

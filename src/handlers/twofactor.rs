@@ -16,9 +16,11 @@ use crate::{
     mail,
     models::twofactor::{
         ActivateEmailData, DisableAuthenticatorData, DisableTwoFactorData, EmailTokenData,
-        EnableAuthenticatorData, SendEmailData, SendEmailLoginData, TwoFactor, TwoFactorType,
+        EnableAuthenticatorData, EnableYubikeyData, SendEmailData, SendEmailLoginData, TwoFactor,
+        TwoFactorType, YubikeyMetadata,
     },
     models::user::{PasswordOrOtpData, User},
+    yubico,
 };
 
 /// List all 2FA records for a user (excludes atype >= 1000).
@@ -37,12 +39,13 @@ pub(crate) async fn list_user_twofactors(
 
 /// Whether the user has 2FA enabled.
 ///
-/// Authenticator (TOTP) and Email count. Remember-device tokens do not.
+/// Authenticator (TOTP), Email, and YubiKey count. Remember-device tokens do not.
 pub(crate) fn is_twofactor_enabled(twofactors: &[TwoFactor]) -> bool {
     twofactors.iter().any(|tf| {
         tf.enabled
             && (tf.atype == TwoFactorType::Authenticator as i32
-                || tf.atype == TwoFactorType::Email as i32)
+                || tf.atype == TwoFactorType::Email as i32
+                || tf.atype == TwoFactorType::YubiKey as i32)
     })
 }
 
@@ -53,7 +56,8 @@ pub(crate) fn enabled_twofactor_provider_ids(twofactors: &[TwoFactor]) -> Vec<i3
         .filter(|tf| {
             tf.enabled
                 && (tf.atype == TwoFactorType::Authenticator as i32
-                    || tf.atype == TwoFactorType::Email as i32)
+                    || tf.atype == TwoFactorType::Email as i32
+                    || tf.atype == TwoFactorType::YubiKey as i32)
         })
         .map(|tf| tf.atype)
         .collect();
@@ -800,4 +804,137 @@ async fn clear_recovery_if_no_twofactor(db: &crate::db::Db, user_id: &str) -> Re
     }
 
     Ok(())
+}
+
+fn jsonify_yubikeys(keys: &[String], enabled: bool, nfc: bool) -> Value {
+    let mut result = serde_json::Map::new();
+    for (i, key) in keys.iter().enumerate() {
+        result.insert(format!("Key{}", i + 1), Value::String(key.clone()));
+    }
+    result.insert("enabled".into(), Value::Bool(enabled));
+    result.insert("nfc".into(), Value::Bool(nfc));
+    // Historical Bitwarden object name (also used by Vaultwarden).
+    result.insert("object".into(), Value::String("twoFactorU2f".into()));
+    Value::Object(result)
+}
+
+/// POST /api/two-factor/get-yubikey
+#[worker::send]
+pub async fn get_yubikey(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<PasswordOrOtpData>,
+) -> Result<Json<Value>, AppError> {
+    yubico::ensure_configured(&env)?;
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(&user, &data).await?;
+
+    let existing = find_twofactor(&db, &user_id, TwoFactorType::YubiKey).await?;
+    match existing {
+        Some(tf) => {
+            let meta = YubikeyMetadata::from_json(&tf.data)?;
+            Ok(Json(jsonify_yubikeys(&meta.keys, true, meta.nfc)))
+        }
+        None => Ok(Json(serde_json::json!({
+            "enabled": false,
+            "object": "twoFactorU2f",
+        }))),
+    }
+}
+
+/// POST/PUT /api/two-factor/yubikey — verify OTPs with YubiCloud and enable YubiKey 2FA.
+#[worker::send]
+pub async fn activate_yubikey(
+    State(env): State<Arc<Env>>,
+    AuthUser(user_id, _): AuthUser,
+    Json(data): Json<EnableYubikeyData>,
+) -> Result<Json<Value>, AppError> {
+    yubico::ensure_configured(&env)?;
+    let db = db::get_db(&env)?;
+    let user = load_user(&db, &user_id).await?;
+    validate_password_or_otp(
+        &user,
+        &PasswordOrOtpData {
+            master_password_hash: data.master_password_hash.clone(),
+            otp: data.otp.clone(),
+        },
+    )
+    .await?;
+
+    let mut keys = Vec::new();
+    for otp in data.otps() {
+        let otp = otp.trim();
+        // Empty or already-registered 12-char public ids are accepted without re-verify
+        // (Vaultwarden-compatible reconfiguration).
+        if otp.is_empty() {
+            continue;
+        }
+        if otp.len() == 12 {
+            keys.push(otp.to_lowercase());
+            continue;
+        }
+        if otp.len() != 44 {
+            return Err(AppError::BadRequest(
+                "Invalid YubiKey OTP length".to_string(),
+            ));
+        }
+        yubico::verify_otp(&env, otp).await?;
+        keys.push(otp[..12].to_lowercase());
+    }
+
+    if keys.is_empty() {
+        return Err(AppError::BadRequest(
+            "At least one YubiKey OTP is required".to_string(),
+        ));
+    }
+
+    keys.sort();
+    keys.dedup();
+
+    let meta = YubikeyMetadata {
+        keys: keys.clone(),
+        nfc: data.nfc,
+    };
+
+    d1_query!(
+        &db,
+        "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype = ?2",
+        &user_id,
+        TwoFactorType::YubiKey as i32
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    let twofactor = TwoFactor::new(user_id.clone(), TwoFactorType::YubiKey, meta.to_json()?);
+    d1_query!(
+        &db,
+        "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        &twofactor.uuid,
+        &twofactor.user_uuid,
+        twofactor.atype,
+        twofactor.enabled as i32,
+        &twofactor.data,
+        twofactor.last_used
+    )
+    .map_err(|_| AppError::Database)?
+    .run()
+    .await
+    .map_err(|_| AppError::Database)?;
+
+    generate_recovery_code_for_user(&db, &user_id).await?;
+
+    Ok(Json(jsonify_yubikeys(&meta.keys, true, meta.nfc)))
+}
+
+/// PUT /api/two-factor/yubikey
+#[worker::send]
+pub async fn activate_yubikey_put(
+    env: State<Arc<Env>>,
+    auth_user: AuthUser,
+    data: Json<EnableYubikeyData>,
+) -> Result<Json<Value>, AppError> {
+    activate_yubikey(env, auth_user, data).await
 }

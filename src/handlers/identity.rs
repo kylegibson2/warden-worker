@@ -35,10 +35,10 @@ use crate::{
         auth_request::AuthRequest,
         device::{Device, DeviceType},
         send::{SendAccessTokenResponse, SendDB},
-        twofactor::{EmailTokenData, TwoFactor, TwoFactorType},
+        twofactor::{EmailTokenData, TwoFactor, TwoFactorType, YubikeyMetadata},
         user::User,
     },
-    push,
+    push, yubico,
 };
 
 const PASSWORD_SCOPE: &str = "api offline_access";
@@ -405,7 +405,7 @@ fn validate_remember_token(
     raw_token: &str,
     twofactor_ids: &[i32],
 ) -> Result<(), AppError> {
-    let required = || AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids, None));
+    let required = || AppError::TwoFactorRequired(json_err_twofactor(twofactor_ids, None, None));
     let secret = env.secret("JWT_REFRESH_SECRET")?.to_string();
     let key = Hs256Key::new(secret.as_bytes());
     let token = UntrustedToken::new(raw_token).map_err(|_| required())?;
@@ -590,6 +590,11 @@ pub async fn token(
                 .find(|tf| tf.enabled && tf.atype == TwoFactorType::Email as i32)
                 .and_then(|tf| EmailTokenData::from_json(&tf.data).ok())
                 .map(|d| d.email);
+            let yubikey_nfc = twofactors
+                .iter()
+                .find(|tf| tf.enabled && tf.atype == TwoFactorType::YubiKey as i32)
+                .and_then(|tf| YubikeyMetadata::from_json(&tf.data).ok())
+                .map(|m| m.nfc);
             let mut should_issue_remember = false;
 
             if is_twofactor_enabled(&twofactors) {
@@ -600,6 +605,7 @@ pub async fn token(
                     AppError::TwoFactorRequired(json_err_twofactor(
                         &twofactor_ids,
                         email_2fa_address.as_deref(),
+                        yubikey_nfc,
                     ))
                 })?;
 
@@ -640,6 +646,31 @@ pub async fn token(
                                 AppError::BadRequest("Email 2FA not configured".to_string())
                             })?;
                         validate_email_login_code(&db, &user.id, twofactor_code, &tf.data).await?;
+                        should_issue_remember = payload.two_factor_remember == Some(1);
+                    }
+                    Some(TwoFactorType::YubiKey) => {
+                        let tf = twofactors
+                            .iter()
+                            .find(|tf| tf.enabled && tf.atype == TwoFactorType::YubiKey as i32)
+                            .ok_or_else(|| {
+                                AppError::BadRequest("YubiKey 2FA not configured".to_string())
+                            })?;
+                        let otp = twofactor_code.trim();
+                        if otp.len() != 44 {
+                            return Err(AppError::BadRequest("Invalid YubiKey OTP".to_string()));
+                        }
+                        let meta = YubikeyMetadata::from_json(&tf.data)?;
+                        let public_id = &otp[..12];
+                        if !meta
+                            .keys
+                            .iter()
+                            .any(|k| k.eq_ignore_ascii_case(public_id))
+                        {
+                            return Err(AppError::BadRequest(
+                                "Given YubiKey is not registered".to_string(),
+                            ));
+                        }
+                        yubico::verify_otp(env.as_ref(), otp).await?;
                         should_issue_remember = payload.two_factor_remember == Some(1);
                     }
                     Some(TwoFactorType::Remember) => {
@@ -802,7 +833,11 @@ pub async fn token(
 }
 
 /// Generates the JSON error response for 2FA required
-fn json_err_twofactor(providers: &[i32], email_2fa: Option<&str>) -> Value {
+fn json_err_twofactor(
+    providers: &[i32],
+    email_2fa: Option<&str>,
+    yubikey_nfc: Option<bool>,
+) -> Value {
     let mut result = serde_json::json!({
         "error": "invalid_grant",
         "error_description": "Two factor required.",
@@ -818,6 +853,14 @@ fn json_err_twofactor(providers: &[i32], email_2fa: Option<&str>) -> Value {
             if let Some(email) = email_2fa {
                 result["TwoFactorProviders2"][provider.to_string()] = serde_json::json!({
                     "Email": obscure_email(email),
+                });
+                continue;
+            }
+        }
+        if *provider == TwoFactorType::YubiKey as i32 {
+            if let Some(nfc) = yubikey_nfc {
+                result["TwoFactorProviders2"][provider.to_string()] = serde_json::json!({
+                    "Nfc": nfc,
                 });
                 continue;
             }
