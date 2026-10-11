@@ -100,7 +100,9 @@ The frontend is bundled with the Worker using [Cloudflare Workers Static Assets]
   - `mkdir -p public/web-vault/css/ public/web-vault/js/`
   - `cp public/css/vaultwarden.css public/web-vault/css/`
   - `cp public/js/warden-devices.js public/web-vault/js/` and inject the script into `index.html`
+  - `cp public/js/warden-version.js public/web-vault/js/` and inject the script into `index.html`
 - `warden-devices.js` adds a **Revoke a device** panel on Settings → Devices (upstream has no per-device remove button).
+- `warden-version.js` adds a muted build line at the bottom of the account menu, e.g. `Warden v0.7.2 · Web vault v2026.6.4`. The Worker version comes from `wardenVersion` in `GET /api/config`, the frontend version from the `/version.json` shipped by `bw_web_builds`.
 
 > [!NOTE]
 > Migrating from separate frontend deployment? If you previously deployed the frontend separately to Cloudflare Pages, you can delete the `warden-frontend` Pages project and re-setup the router for the worker. The frontend is now bundled with the Worker and no longer requires a separate deployment.

@@ -43,6 +43,11 @@ pub async fn config(
         // - Mobile app support for MasterPasswordUnlockData: 2025.8.0
         "version": "2026.6.0",
         "gitHash": "5d84f176",
+        // Warden Worker's own release version (the `version` in Cargo.toml), NOT the
+        // Bitwarden-compatible API version above. Extra field: Bitwarden clients ignore
+        // keys they don't know, and the web vault overlay (public/js/warden-version.js)
+        // reads it to show which Worker deploy is live.
+        "wardenVersion": env!("CARGO_PKG_VERSION"),
         "server": {
           "name": "Vaultwarden",
           "url": "https://github.com/dani-garcia/vaultwarden"

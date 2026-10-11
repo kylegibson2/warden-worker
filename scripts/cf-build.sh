@@ -89,20 +89,33 @@ find public/web-vault -type f -name '*.map' -delete
 mkdir -p public/web-vault/css/ public/web-vault/js/
 cp public/css/vaultwarden.css public/web-vault/css/
 cp public/js/warden-devices.js public/web-vault/js/
-# bw_web_builds already links css/vaultwarden.css; inject our Devices revoke script
-# before the deferred app bundles so window.fetch is patched before API traffic.
-if [ -f public/web-vault/index.html ]; then
-  if ! grep -q 'js/warden-devices.js' public/web-vault/index.html; then
-    awk '{
-      if (!done && $0 ~ /<script defer="defer" src="app\/polyfills/) {
-        print "<script defer=\"defer\" src=\"js/warden-devices.js\"></script>"
-        done=1
-      }
-      print
-    }' public/web-vault/index.html > public/web-vault/index.html.tmp
-    mv public/web-vault/index.html.tmp public/web-vault/index.html
+cp public/js/warden-version.js public/web-vault/js/
+# bw_web_builds already links css/vaultwarden.css; inject our scripts before the
+# deferred app bundles so window.fetch is patched before API traffic and the
+# account-menu overlay hooks run before the vault renders.
+inject_script() {
+  local src="$1"
+  if [ ! -f public/web-vault/index.html ]; then
+    echo "WARNING: public/web-vault/index.html not found; skipping ${src}" >&2
+    return
   fi
-fi
+  if grep -q "src=\"${src}\"" public/web-vault/index.html; then
+    echo "Already present: ${src}"
+    return
+  fi
+  # The Angular build emits index.html as a single very long line, so anchor on
+  # the app bundle reference rather than on a line number. The tag must go
+  # AFTER <!doctype html> but before the app bundles: a script placed ahead of
+  # the doctype makes browsers discard it and parse the page in quirks mode.
+  sed -i "s|<script defer=\"defer\" src=\"app/polyfills|<script defer=\"defer\" src=\"${src}\"></script><script defer=\"defer\" src=\"app/polyfills|" public/web-vault/index.html
+  if ! grep -q "src=\"${src}\"" public/web-vault/index.html; then
+    echo "ERROR: could not inject ${src}: app bundle anchor not found in index.html" >&2
+    exit 1
+  fi
+  echo "Injected: ${src}"
+}
+inject_script "js/warden-devices.js"
+inject_script "js/warden-version.js"
 cp public/_headers public/web-vault/_headers
 echo "Frontend ready in public/web-vault"
 

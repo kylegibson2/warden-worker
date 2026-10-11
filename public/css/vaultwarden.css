@@ -163,3 +163,11 @@ bit-nav-logo bit-nav-item .bwi-shield {
   opacity: 0.6;
   cursor: wait;
 }
+
+/* Build-version footer in the account menu (public/js/warden-version.js).
+   Colour/theme come from the vault's own `tw-text-muted` utility, which the
+   injected markup reuses; only the sizing is adjusted here. */
+.warden-version {
+  font-size: 0.8125rem;
+  line-height: 1.35;
+}
